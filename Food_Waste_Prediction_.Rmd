@@ -1,0 +1,524 @@
+---
+title: "Food Waste Prediction and Smart Meal Demand Optimization"
+subtitle: "An R-Based Data Science Case Study"
+author: "Gondela Durga Gnana Deekshita"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    df_print: paged
+  word_document:
+    toc: true
+    toc_depth: 3
+params:
+  data_file: "food_waste_meal_demand.csv"
+  seed: 123
+  train_fraction: 0.80
+  ntree: 300
+  safety_factor: 0.05
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5, dpi = 120)
+required_packages <- c("readr", "dplyr", "ggplot2", "caret", "randomForest",
+                       "knitr", "lubridate")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+invisible(lapply(required_packages, library, character.only = TRUE))
+set.seed(params$seed)
+```
+
+# Executive Summary
+
+This case study analyzes meal-demand and food-leftover records to support more informed meal preparation. The workflow imports and validates the supplied CSV, summarizes demand and waste, creates exploratory graphs, trains a Random Forest regression model, evaluates prediction error, and demonstrates a preparation recommendation based on predicted demand plus a configurable safety margin.
+
+The data file expected by this document is `food_waste_meal_demand(2).csv`. Keep it in the same folder as this R Markdown file, or change the `data_file` parameter below. The report prints results from the dataset when it is knitted; no fixed performance values are hard-coded.
+
+# 1. Introduction
+
+## 1.1 Problem Statement
+
+Food-service facilities need to prepare enough meals to meet demand while avoiding unnecessary surplus. Preparing more meals than are served can increase leftovers, while preparing too few can cause shortages. Historical meal records can help identify patterns and estimate the number of meals likely to be served.
+
+## 1.2 Objectives
+
+- Inspect and prepare the supplied historical dataset.
+- Summarize meal demand, preparation quantities, and leftovers.
+- Compare demand and leftovers across meal types and days.
+- Fit a Random Forest regression model to predict `Meals_Served`.
+- Evaluate predictions using RMSE, MAE, and squared correlation, matching the metric used in the supplied R script.
+- Demonstrate a preparation target using predicted demand and a safety margin.
+- Document limitations and reproducibility steps.
+
+# 2. Dataset and Implementation Setup
+
+## 2.1 Import the Dataset
+
+```{r import-data}
+data_file <- params$data_file
+if (!file.exists(data_file)) {
+  stop(paste0(
+    "Dataset not found: ", data_file,
+    ". Place the CSV beside this Rmd file or change params$data_file in the YAML header. ",
+    "Current working directory: ", getwd()
+  ))
+}
+food_raw <- readr::read_csv(data_file, show_col_types = FALSE)
+cat("Original rows:", nrow(food_raw), "\n")
+cat("Original columns:", ncol(food_raw), "\n")
+knitr::kable(head(food_raw, 8), caption = "First eight rows of the supplied dataset")
+```
+
+## 2.2 Dataset Structure
+
+The expected fields are:
+
+| Variable            | Description                     | Role                |
+|---------------------|---------------------------------|---------------------|
+| `Date`              | Date of meal/service            | Time feature        |
+| `Meal_Type`         | Breakfast, lunch, dinner, etc.  | Predictor           |
+| `Day_of_Week`       | Day on which the meal is served | Predictor           |
+| `Meals_Prepared`    | Number of meals prepared        | Operational measure |
+| `Meals_Served`      | Number of meals served          | Prediction target   |
+| `Leftover_Quantity` | Food remaining after service    | Waste measure       |
+| `Consumers`         | Consumer count                  | Predictor           |
+| `Event_or_Holiday`  | Special-day indicator           | Predictor           |
+
+The document checks the imported column names. If the CSV does not contain the expected fields, update the mapping or model formula in the code before knitting.
+
+```{r structure}
+data_dictionary <- data.frame(
+  Variable = names(food_raw),
+  Class = vapply(food_raw, function(x) paste(class(x), collapse = "/"), character(1)),
+  Missing_Values = vapply(food_raw, function(x) sum(is.na(x)), integer(1)),
+  stringsAsFactors = FALSE
+)
+knitr::kable(data_dictionary, caption = "Imported variable types and missing-value counts")
+summary(food_raw)
+```
+
+# 3. Data Preparation
+
+## 3.1 Duplicate and Missing-Value Checks
+
+Exact duplicate rows are counted and removed. Missing values are reported before modelling. Rows with missing values in the selected model fields are omitted for model fitting; the report does not silently impute those values.
+
+```{r clean-data}
+food <- food_raw
+duplicate_count <- sum(duplicated(food))
+food <- food[!duplicated(food), , drop = FALSE]
+
+cat("Exact duplicate rows found:", duplicate_count, "\n")
+cat("Rows after duplicate removal:", nrow(food), "\n")
+
+missing_table <- data.frame(
+  Variable = names(food),
+  Missing_Count = vapply(food, function(x) sum(is.na(x)), integer(1)),
+  Missing_Percent = round(vapply(food, function(x) mean(is.na(x)) * 100, numeric(1)), 2)
+)
+knitr::kable(missing_table, caption = "Missing values after exact duplicate removal")
+```
+
+## 3.2 Data Types and Validation
+
+```{r types-validation}
+required_columns <- c(
+  "Date", "Meal_Type", "Day_of_Week", "Meals_Prepared",
+  "Meals_Served", "Leftover_Quantity", "Consumers", "Event_or_Holiday"
+)
+missing_columns <- setdiff(required_columns, names(food))
+if (length(missing_columns) > 0) {
+  stop(paste("Required columns missing from the CSV:", paste(missing_columns, collapse = ", ")))
+}
+
+food$Date <- as.Date(food$Date)
+food$Meal_Type <- as.factor(food$Meal_Type)
+food$Day_of_Week <- as.factor(food$Day_of_Week)
+food$Event_or_Holiday <- as.factor(food$Event_or_Holiday)
+
+numeric_columns <- intersect(
+  c("Meals_Prepared", "Meals_Served", "Leftover_Quantity", "Consumers"),
+  names(food)
+)
+negative_check <- data.frame(
+  Variable = numeric_columns,
+  Negative_Count = vapply(numeric_columns, function(nm)
+    sum(food[[nm]] < 0, na.rm = TRUE), integer(1))
+)
+knitr::kable(negative_check, caption = "Negative-value validation")
+```
+
+## 3.3 Feature Engineering
+
+Waste rate is the leftover quantity divided by the number of meals prepared. Service rate is meals served divided by meals prepared. Both are undefined when the number prepared is zero or missing.
+
+```{r feature-engineering}
+food$Waste_Rate <- ifelse(
+  !is.na(food$Meals_Prepared) & food$Meals_Prepared > 0,
+  food$Leftover_Quantity / food$Meals_Prepared,
+  NA_real_
+)
+food$Service_Rate <- ifelse(
+  !is.na(food$Meals_Prepared) & food$Meals_Prepared > 0,
+  food$Meals_Served / food$Meals_Prepared,
+  NA_real_
+)
+
+# Values outside the expected 0-1 interval are flagged as missing for rate summaries.
+food$Waste_Rate[food$Waste_Rate < 0 | food$Waste_Rate > 1] <- NA_real_
+food$Service_Rate[food$Service_Rate < 0 | food$Service_Rate > 1] <- NA_real_
+
+knitr::kable(
+  data.frame(
+    Measure = c("Waste rate", "Service rate"),
+    Formula = c(
+      "Leftover_Quantity / Meals_Prepared",
+      "Meals_Served / Meals_Prepared"
+    )
+  ),
+  caption = "Derived measures"
+)
+```
+
+# 4. Exploratory Data Analysis
+
+## 4.1 Overall Descriptive Statistics
+
+```{r descriptive}
+descriptive <- data.frame(
+  Measure = c(
+    "Observations after duplicate removal",
+    "Number of source columns",
+    "Average meals prepared",
+    "Average meals served",
+    "Average leftover quantity",
+    "Average waste rate (%)",
+    "Average service rate (%)"
+  ),
+  Value = c(
+    nrow(food),
+    ncol(food_raw),
+    mean(food$Meals_Prepared, na.rm = TRUE),
+    mean(food$Meals_Served, na.rm = TRUE),
+    mean(food$Leftover_Quantity, na.rm = TRUE),
+    100 * mean(food$Waste_Rate, na.rm = TRUE),
+    100 * mean(food$Service_Rate, na.rm = TRUE)
+  )
+)
+descriptive$Value <- round(as.numeric(descriptive$Value), 3)
+knitr::kable(descriptive, caption = "Overall descriptive results")
+```
+
+## 4.2 Analysis by Meal Type
+
+```{r meal-summary}
+meal_summary <- food %>%
+  group_by(Meal_Type) %>%
+  summarise(
+    Records = n(),
+    Average_Prepared = mean(Meals_Prepared, na.rm = TRUE),
+    Average_Served = mean(Meals_Served, na.rm = TRUE),
+    Average_Leftover = mean(Leftover_Quantity, na.rm = TRUE),
+    Average_Waste_Rate_Percent = 100 * mean(Waste_Rate, na.rm = TRUE),
+    .groups = "drop"
+  )
+knitr::kable(meal_summary, digits = 2, caption = "Demand and leftovers by meal type")
+```
+
+## 4.3 Average Demand by Meal Type
+
+```{r plot-demand, fig.cap="Figure 1. Average meals served by meal type."}
+ggplot(food, aes(x = Meal_Type, y = Meals_Served)) +
+  stat_summary(fun = mean, geom = "col") +
+  labs(title = "Average Meal Demand by Meal Type",
+       x = "Meal Type", y = "Average Meals Served") +
+  theme_minimal()
+```
+
+Interpretation: compare the bar heights to identify meal types with higher average demand. The highest category should be identified from the knitted chart or the meal summary table.
+
+## 4.4 Average Leftovers by Meal Type
+
+```{r plot-leftovers, fig.cap="Figure 2. Average leftover quantity by meal type."}
+ggplot(food, aes(x = Meal_Type, y = Leftover_Quantity)) +
+  stat_summary(fun = mean, geom = "col") +
+  labs(title = "Average Leftover Quantity by Meal Type",
+       x = "Meal Type", y = "Average Leftover Quantity") +
+  theme_minimal()
+```
+
+Interpretation: categories with larger average leftover quantities may warrant closer review of preparation quantities and demand variability. Leftovers alone do not establish avoidable waste without considering meal volume and service requirements.
+
+## 4.5 Meal Demand Over Time
+
+```{r plot-time, fig.cap="Figure 3. Meal demand over time."}
+daily_demand <- food %>%
+  filter(!is.na(Date), !is.na(Meals_Served)) %>%
+  group_by(Date) %>%
+  summarise(Meals_Served = mean(Meals_Served), .groups = "drop")
+
+ggplot(daily_demand, aes(x = Date, y = Meals_Served)) +
+  geom_line() +
+  labs(title = "Meal Demand Over Time", x = "Date", y = "Average Meals Served") +
+  theme_minimal()
+```
+
+Interpretation: the time-series plot can reveal demand fluctuations or recurring periods. A trend should only be stated if it is visible in the generated graph.
+
+## 4.6 Demand by Day of Week
+
+```{r plot-weekday, fig.cap="Figure 4. Distribution of meals served by day of week."}
+ggplot(food, aes(x = Day_of_Week, y = Meals_Served)) +
+  geom_boxplot() +
+  labs(title = "Meal Demand Distribution by Day of Week",
+       x = "Day of Week", y = "Meals Served") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+Interpretation: the median line and spread of each box show how demand differs across weekdays. A wider box indicates greater variation in the middle half of observations.
+
+## 4.7 Meals Prepared Versus Leftovers
+
+```{r plot-prepared-leftovers, fig.cap="Figure 5. Relationship between meals prepared and leftover quantity."}
+ggplot(food, aes(x = Meals_Prepared, y = Leftover_Quantity)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Meals Prepared vs Leftover Quantity",
+       x = "Meals Prepared", y = "Leftover Quantity") +
+  theme_minimal()
+```
+
+Interpretation: the scatter plot shows whether larger preparation quantities tend to coincide with more leftovers. This association does not by itself prove causation.
+
+# 5. Predictive Modelling
+
+## 5.1 Target and Predictors
+
+The target variable is `Meals_Served`. The predictors are `Meal_Type`, `Day_of_Week`, `Consumers`, and `Event_or_Holiday`. This follows the modelling design in the supplied R script.
+
+## 5.2 Prepare Training and Testing Data
+
+An 80/20 split is used with a fixed random seed to make the split reproducible. This random split is appropriate for a basic demonstration; if the intended task is forecasting future dates, a chronological split should be considered to reduce temporal leakage.
+
+```{r split}
+model_data <- food %>%
+  select(Meals_Served, Meal_Type, Day_of_Week, Consumers, Event_or_Holiday) %>%
+  tidyr::drop_na()
+
+if (nrow(model_data) < 10) {
+  stop("Too few complete records remain for modelling. Check the dataset and missing values.")
+}
+if (length(unique(model_data$Meals_Served)) < 2) {
+  stop("Meals_Served has fewer than two distinct values; regression evaluation is not possible.")
+}
+
+set.seed(params$seed)
+train_index <- caret::createDataPartition(
+  model_data$Meals_Served,
+  p = params$train_fraction,
+  list = FALSE
+)
+train <- model_data[train_index, , drop = FALSE]
+test <- model_data[-train_index, , drop = FALSE]
+
+split_summary <- data.frame(
+  Dataset = c("Complete model data", "Training set", "Testing set"),
+  Rows = c(nrow(model_data), nrow(train), nrow(test))
+)
+knitr::kable(split_summary, caption = "Training and testing split")
+```
+
+## 5.3 Fit Random Forest Regression
+
+Random Forest fits an ensemble of decision trees and averages their predictions for a numeric target. The model uses 300 trees by default, as in the supplied R script.
+
+```{r fit-random-forest}
+set.seed(params$seed)
+rf_model <- randomForest::randomForest(
+  Meals_Served ~ .,
+  data = train,
+  ntree = params$ntree,
+  importance = TRUE
+)
+print(rf_model)
+```
+
+## 5.4 Predict and Evaluate
+
+RMSE and MAE are measured in meal units. RMSE gives relatively greater weight to larger errors. MAE is the average absolute prediction error. The R-squared-style metric below is squared correlation between actual and predicted values, matching the original script; it is not identical to the conventional predictive R-squared based on residual sum of squares.
+
+```{r evaluate-model}
+predicted_demand <- predict(rf_model, newdata = test)
+results <- data.frame(
+  Actual = test$Meals_Served,
+  Predicted = as.numeric(predicted_demand)
+)
+
+rmse <- sqrt(mean((results$Actual - results$Predicted)^2))
+mae <- mean(abs(results$Actual - results$Predicted))
+r_squared <- if (sd(results$Actual) > 0 && sd(results$Predicted) > 0) {
+  cor(results$Actual, results$Predicted)^2
+} else {
+  NA_real_
+}
+
+evaluation <- data.frame(
+  Metric = c("RMSE (meals)", "MAE (meals)", "Squared correlation (R-squared-style)"),
+  Value = c(rmse, mae, r_squared)
+)
+knitr::kable(evaluation, digits = 4, caption = "Random Forest test-set evaluation")
+```
+
+## 5.5 Actual Versus Predicted Demand
+
+```{r plot-actual-predicted, fig.cap="Figure 6. Actual versus Random Forest-predicted meals served."}
+ggplot(results, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = "Actual vs Predicted Meal Demand",
+       x = "Actual Meals Served", y = "Predicted Meals Served") +
+  theme_minimal()
+```
+
+Interpretation: points close to the dashed diagonal represent predictions close to actual values. Systematic deviations above or below the line may indicate overprediction or underprediction in parts of the demand range.
+
+## 5.6 Feature Importance
+
+```{r feature-importance, fig.cap="Figure 7. Random Forest feature importance."}
+importance_values <- randomForest::importance(rf_model)
+importance_df <- data.frame(
+  Variable = rownames(importance_values),
+  Importance = importance_values[, 1],
+  row.names = NULL
+) %>%
+  arrange(desc(Importance))
+knitr::kable(importance_df, digits = 3, caption = "Random Forest variable importance")
+
+ggplot(importance_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Random Forest Feature Importance",
+       x = "Variable", y = "Importance") +
+  theme_minimal()
+```
+
+Interpretation: larger importance values indicate variables that contribute more to the model's prediction according to the selected importance measure. Importance is not proof of a causal effect.
+
+# 6. Smart Meal Demand Optimization
+
+## 6.1 Preparation Recommendation
+
+The demonstration policy adds a configurable safety factor to predicted demand:
+
+$$\text{Recommended Preparation}
+=
+\left\lceil
+\text{Predicted Demand}\times(1+\text{Safety Factor})
+\right\rceil$$
+
+The default safety factor is 5%. This is an illustrative buffer, not a universal optimum; it should be selected using validation data and the operational cost of shortages versus surplus.
+
+```{r optimize}
+safety_factor <- params$safety_factor
+optimization_results <- data.frame(
+  Actual_Demand = test$Meals_Served,
+  Predicted_Demand = as.numeric(predicted_demand)
+)
+optimization_results$Recommended_Preparation <- ceiling(
+  pmax(0, optimization_results$Predicted_Demand) * (1 + safety_factor)
+)
+optimization_results$Estimated_Surplus <- pmax(
+  optimization_results$Recommended_Preparation - optimization_results$Actual_Demand, 0
+)
+optimization_results$Estimated_Shortage <- pmax(
+  optimization_results$Actual_Demand - optimization_results$Recommended_Preparation, 0
+)
+
+knitr::kable(head(optimization_results, 10), digits = 2,
+             caption = "Example preparation recommendations for ten test records")
+```
+
+## 6.2 Interpreting the Optimization Results
+
+The table compares recommended preparation quantities with actual test-set demand. `Estimated_Surplus` and `Estimated_Shortage` are retrospective simulation measures, not observed real-world outcomes from a deployed system. They do not directly measure food waste unless the operational meaning and units of the leftover field are validated.
+
+A credible waste-reduction claim requires comparison against an existing preparation policy or a prospective pilot, using actual prepared quantities, meals served, leftovers, and shortage outcomes.
+
+# 7. Consolidated Results
+
+```{r final-results}
+final_results <- data.frame(
+  Measure = c(
+    "Original observations",
+    "Original variables",
+    "Exact duplicate rows removed",
+    "Observations after duplicate removal",
+    "Complete model records",
+    "Training records",
+    "Testing records",
+    "Average meals prepared",
+    "Average meals served",
+    "Average leftover quantity",
+    "Average waste rate (%)",
+    "Random Forest RMSE",
+    "Random Forest MAE",
+    "Squared correlation (R-squared-style)",
+    "Safety factor (%)"
+  ),
+  Result = c(
+    nrow(food_raw),
+    ncol(food_raw),
+    duplicate_count,
+    nrow(food),
+    nrow(model_data),
+    nrow(train),
+    nrow(test),
+    mean(food$Meals_Prepared, na.rm = TRUE),
+    mean(food$Meals_Served, na.rm = TRUE),
+    mean(food$Leftover_Quantity, na.rm = TRUE),
+    100 * mean(food$Waste_Rate, na.rm = TRUE),
+    rmse,
+    mae,
+    r_squared,
+    100 * safety_factor
+  )
+)
+final_results$Result <- signif(as.numeric(final_results$Result), 5)
+knitr::kable(final_results, caption = "Consolidated results generated from the supplied dataset")
+```
+
+# 8. Discussion
+
+The analysis links historical demand patterns to a predictive model and a simple meal-preparation policy. The descriptive tables identify average demand and leftovers; the plots help compare meal types and time periods; the model estimates meals served for held-out records; and the optimization rule converts each prediction into a preparation target.
+
+The model should be interpreted in light of its predictor set and split strategy. The present model does not include lagged demand or previous service records as predictors, so it is a basic regression demonstration rather than a full time-series forecasting system. A chronological test split and comparison with simple baselines would strengthen a future version.
+
+# 9. Limitations
+
+- Missing predictor rows are excluded from model training; the number of retained rows is printed in the report.
+- A random train/test split may not reflect future forecasting performance when observations are time-dependent.
+- Squared correlation is reported to match the supplied script, but conventional predictive R-squared can give a different value.
+- Feature importance indicates predictive contribution, not causation.
+- The 5% safety factor is illustrative and should be tuned to operational requirements.
+- Estimated waste reduction is not claimed without a baseline or pilot comparison.
+
+# 10. Conclusion
+
+This case study provides a reproducible R workflow for food-waste and meal-demand analysis. It imports and validates the supplied dataset, calculates demand and waste summaries, visualizes meal patterns, trains a Random Forest regression model, evaluates predictions, and demonstrates a preparation recommendation with a configurable safety margin. The knitted report supplies the actual descriptive and model results produced by R. Operational effectiveness should be established through a suitable baseline or pilot before claiming a reduction in food waste.
+
+# 11. References
+
+1.  R Core Team. *R: A Language and Environment for Statistical Computing*. R Foundation for Statistical Computing.
+2.  Liaw, A., & Wiener, M. (2002). Classification and regression by randomForest. *R News, 2*(3), 18–22.
+3.  Breiman, L. (2001). Random Forests. *Machine Learning, 45*, 5–32.
+4.  Kuhn, M. (2008). Building predictive models in R using the caret package. *Journal of Statistical Software, 28*(5), 1–26.
+5.  Wickham, H., Averick, M., Bryan, J., Chang, W., McGowan, L. D., François, R., et al. (2019). Welcome to the tidyverse. *Journal of Open Source Software, 4*(43), 1686.
